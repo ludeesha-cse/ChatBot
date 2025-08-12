@@ -5,7 +5,6 @@ from langchain_community.utilities import GoogleSerperAPIWrapper
 from typing import List, TypedDict, Optional
 import os
 from dotenv import load_dotenv
-import json
 
 # Load environment variables from .env file
 load_dotenv()
