@@ -34,11 +34,12 @@ This document summarizes the work completed so far on building a **RAG pipeline 
     ```
     CREATE EXTENSION IF NOT EXISTS vector;
 
-    create table documents (
-    id uuid primary key,
-    content text,
-    embedding vector(3072),
-    metadata jsonb
+    create table if not exists documents (
+        id uuid primary key,
+        content text,
+        embedding vector(3072),
+        metadata jsonb,
+        content_hash text unique
     );
     ```
 - Database RPC function
@@ -86,3 +87,14 @@ This document summarizes the work completed so far on building a **RAG pipeline 
   - insert_documents() → inserts chunks with embeddings and metadata.
 
 - Verified ingestion works, chunks stored in Supabase with embeddings.
+
+## **4. Implemented Hashing and comparsion to avoid duplicate vector embeddings**
+
+- Used SHA256 hashing mechnaism to hash the context
+- Compared and skipped duplicate context 
+```
+  def compute_hash(text: str) -> str:
+      """Compute SHA256 hash of text."""
+      return hashlib.sha256(text.encode('utf-8')).hexdigest()
+```
+
