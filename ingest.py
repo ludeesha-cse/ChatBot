@@ -45,7 +45,7 @@ def run_ingestion(supabase):
 
     # Insert into Supabase (only new content)
     insert_documents(supabase, docs_to_insert)
-    print("🚀 Ingestion process finished.")
+    print("Ingestion process finished.")
 
 if __name__ == "__main__":
     run_ingestion()

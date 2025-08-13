@@ -21,7 +21,7 @@ def insert_documents(supabase, docs):
         # Check if hash exists in DB
         existing = supabase.table("documents").select("id").eq("content_hash", text_hash).execute()
         if existing.data:
-            print(f"⏩ Skipped chunk (hash exists): {text_hash}")
+            print(f"Skipped chunk (hash exists): {text_hash}")
             continue
 
         # Insert new record
@@ -32,4 +32,4 @@ def insert_documents(supabase, docs):
             "metadata": metadata,
             "content_hash": text_hash,
         }).execute()
-        print(f"✅ Inserted chunk (hash: {text_hash})")
+        print(f"Inserted chunk (hash: {text_hash})")
