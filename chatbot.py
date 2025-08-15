@@ -1,130 +1,174 @@
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.utilities import GoogleSerperAPIWrapper
-from typing import List, TypedDict, Optional
 import os
-from dotenv import load_dotenv
+from typing import List, Optional, TypedDict
 
-# Load environment variables from .env file
+from dotenv import load_dotenv
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from langchain_community.utilities import GoogleSerperAPIWrapper
+
+# Local RAG retriever
+from retrieve import retrieve_context
+
+
+# Load env
 load_dotenv()
 
-# Access API keys
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-serper_api_key = os.getenv("SERPER_API_KEY")
-if not gemini_api_key:
-    raise ValueError("GEMINI_API_KEY not found in .env file. Please ensure it is set correctly.")
-if not serper_api_key:
-    raise ValueError("SERPER_API_KEY not found in .env file. Please obtain it from https://serper.dev.")
 
-# Define the chatbot state
 class ChatbotState(TypedDict):
     messages: List[HumanMessage | AIMessage]
     search_results: Optional[str]
     needs_search: bool
 
-# Initialize the Gemini model
-try:
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-pro",
-        temperature=0.7,
-        google_api_key=gemini_api_key
-    )
-except Exception as e:
-    raise Exception(f"Failed to initialize Gemini model: {str(e)}")
 
-# Initialize the Serper API wrapper
-try:
-    search = GoogleSerperAPIWrapper(serper_api_key=serper_api_key)
-except Exception as e:
-    raise Exception(f"Failed to initialize Serper API: {str(e)}")
+# Initialize LLM (OpenAI)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in environment. Add it to your .env file.")
 
-# Decision function to determine if search is needed using Gemini
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.3,
+    api_key=OPENAI_API_KEY,
+)
+
+
+# Initialize Serper
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+search = None
+if SERPER_API_KEY:
+    try:
+        search = GoogleSerperAPIWrapper(serper_api_key=SERPER_API_KEY)
+    except Exception:
+        # Fallback to no search if initialization fails
+        search = None
+
+
 def should_search(state: ChatbotState) -> str:
+    """Ask the LLM if we need a web search for the last user message."""
+    if not search:
+        return "chatbot_node"
+
     user_message = state["messages"][-1].content if state["messages"] else ""
     classification_prompt = (
-        f"Determine if the following user query requires a web search to provide an accurate, up-to-date response. "
-        f"Return 'yes' if the query needs real-time data (e.g., news, weather, recent events) or specific external information. "
-        f"Return 'no' if the query can be answered with general knowledge or conversation. "
+        "You are a classifier that decides if a user query requires a web search for fresh/external facts.\n"
+        "Return exactly one word: yes or no.\n\n"
         f"Query: {user_message}"
     )
     try:
-        response = llm.invoke([HumanMessage(content=classification_prompt)])
-        decision = response.content.strip().lower()
-        return "search_node" if decision == "yes" else "chatbot_node"
-    except Exception as e:
-        return "chatbot_node"  # Default to chatbot if classification fails
+        resp = llm.invoke([HumanMessage(content=classification_prompt)])
+        decision = (resp.content or "").strip().lower()
+        return "search_node" if decision.startswith("y") else "chatbot_node"
+    except Exception:
+        return "chatbot_node"
 
-# Search node to fetch and format web results
+
 def search_node(state: ChatbotState) -> dict:
-    user_message = state["messages"][-1].content if state["messages"] else ""
+    """Run Serper search and format top results."""
+    if not search:
+        return {"search_results": None, "needs_search": False}
+
+    query = state["messages"][-1].content if state["messages"] else ""
     try:
-        # Use Serper API to get structured results
-        results = search.results(user_message)  # Use .results() for raw JSON
-        formatted_results = ""
-        if "organic" in results:
-            for item in results["organic"][:3]:  # Limit to top 3 organic results
+        results = search.results(query)
+        formatted = ""
+        if isinstance(results, dict) and "organic" in results:
+            for item in results["organic"][:3]:
                 title = item.get("title", "No title")
                 snippet = item.get("snippet", "No description")
-                link = item.get("link", "No link")
-                formatted_results += f"- {title}: {snippet} [Source: {link}]\n"
-        if not formatted_results:
-            formatted_results = "No relevant search results found."
-        return {"search_results": formatted_results, "needs_search": False}
+                link = item.get("link", "")
+                formatted += f"- {title}: {snippet} [Source: {link}]\n"
+        if not formatted:
+            formatted = "No relevant search results found."
+        return {"search_results": formatted, "needs_search": False}
     except Exception as e:
-        return {"search_results": f"Error: Failed to fetch search results: {str(e)}", "needs_search": False}
+        return {"search_results": f"Error fetching search results: {e}", "needs_search": False}
 
-# Chatbot node to generate response
+
 def chatbot_node(state: ChatbotState) -> dict:
+    """Generate the assistant reply using chat history, RAG context and optional search results."""
     user_message = state["messages"][-1].content if state["messages"] else ""
-    search_results = state.get("search_results", "")
-    
-    # Create prompt with conversation history and search results (if any)
-    prompt = f"User: {user_message}\n"
-    if search_results:
-        prompt += f"Search Results:\n{search_results}\n"
-    prompt += "Provide a concise and accurate response based on the conversation history and any available search results. Include source links if search results are used."
-    
-    messages = state["messages"] + [HumanMessage(content=prompt)]
-    
-    try:
-        response = llm.invoke(messages)
-        return {"messages": state["messages"] + [AIMessage(content=response.content)], "needs_search": False}
-    except Exception as e:
-        return {"messages": state["messages"] + [AIMessage(content=f"Error: Failed to generate response: {str(e)}")], "needs_search": False}
 
-# Start node to initialize processing
+    # Retrieve RAG context from vector DB
+    rag_context = ""
+    try:
+        rag_context = retrieve_context(user_message, k=3)
+    except Exception as e:
+        rag_context = f"RAG retrieval error: {e}"
+
+    search_results = state.get("search_results") or ""
+
+    system_instructions = (
+        "You are a helpful assistant. Use provided context snippets when relevant.\n"
+        "If you use search results, cite the sources inline.\n"
+        "If the context is insufficient, say so briefly.\n"
+    )
+
+    # Build conversation with history and enrich the last user turn with RAG/search context
+    history: List[HumanMessage | AIMessage] = list(state.get("messages", []))
+    if history and isinstance(history[-1], HumanMessage):
+        last_user: HumanMessage = history.pop()  # remove last user to augment it
+        enriched_last = HumanMessage(
+            content=(
+                f"{last_user.content}\n\n"
+                f"Context (from documents):\n{rag_context}\n\n"
+                + (f"Search Results:\n{search_results}\n\n" if search_results else "")
+                + "Answer concisely and accurately; include numbered sources if used."
+            )
+        )
+        convo_messages = [SystemMessage(content=system_instructions), *history, enriched_last]
+    else:
+        convo_messages = [
+            SystemMessage(content=system_instructions),
+            HumanMessage(content=user_message),
+        ]
+
+    try:
+        response = llm.invoke(convo_messages)
+        return {
+            "messages": state["messages"] + [AIMessage(content=response.content)],
+            "needs_search": False,
+        }
+    except Exception as e:
+        return {
+            "messages": state["messages"] + [AIMessage(content=f"Error generating response: {e}")],
+            "needs_search": False,
+        }
+
+
 def start_node(state: ChatbotState) -> dict:
     return {"needs_search": True}
 
-# Set up the LangGraph workflow
+
+# Build LangGraph
 workflow = StateGraph(ChatbotState)
 workflow.add_node("start_node", start_node)
 workflow.add_node("search_node", search_node)
 workflow.add_node("chatbot_node", chatbot_node)
 
-# Define edges
 workflow.set_entry_point("start_node")
 workflow.add_conditional_edges(
-    "start_node",
-    should_search,
-    {"search_node": "search_node", "chatbot_node": "chatbot_node"}
+    "start_node", should_search, {"search_node": "search_node", "chatbot_node": "chatbot_node"}
 )
 workflow.add_edge("search_node", "chatbot_node")
 workflow.add_edge("chatbot_node", END)
 
-# Compile the graph
 app = workflow.compile()
 
-# Interactive loop for testing
-if __name__ == "__main__":
-    state = {"messages": [], "search_results": None, "needs_search": True}
+
+def run_chatbot():
+    """Simple CLI loop for chatting."""
+    state: ChatbotState = {"messages": [], "search_results": None, "needs_search": True}
     print("Chatbot started. Type 'quit' to exit.")
     while True:
         user_input = input("You: ")
-        if user_input.lower() == "quit":
+        if user_input.strip().lower() in {"quit", "exit"}:
             break
         state["messages"].append(HumanMessage(content=user_input))
         state["needs_search"] = True
         state = app.invoke(state)
         print("Bot:", state["messages"][-1].content)
+
+
+if __name__ == "__main__":
+    run_chatbot()
