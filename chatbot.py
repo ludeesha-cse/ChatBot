@@ -136,41 +136,47 @@ def chatbot_node(state: ChatbotState) -> dict:
     if has_relevant_rag and not has_search_results:
         # RAG-only response
         system_instructions = (
-            "You are a helpful assistant. Answer the question using the provided document context. "
-            "Be concise and accurate."
+            "You are a helpful assistant. Answer the question using the provided document context and conversation history. "
+            "Be concise and accurate. Reference previous parts of the conversation when relevant."
         )
-        composed_prompt = f"Question: {user_message}\n\nContext: {rag_context}\n\nAnswer based on the context above."
+        context_message = f"Document Context: {rag_context}"
         
     elif has_search_results and not has_relevant_rag:
         # Search-only response
         system_instructions = (
-            "You are a helpful assistant. Answer the question directly using only the provided search results. "
-            "Do not mention document context, primary source, secondary source, or explain your sources of information. "
-            "Just provide a direct answer and cite sources inline when appropriate."
+            "You are a helpful assistant. Answer questions using the conversation history and provided search results. "
+            "Reference previous parts of the conversation when relevant. Cite sources inline when using search results."
         )
-        composed_prompt = f"{user_message}\n\nSearch Results:\n{search_results}\n\nProvide a direct answer to the question using the search results."
+        context_message = f"Search Results: {search_results}"
         
     elif has_relevant_rag and has_search_results:
         # Both RAG and search available
         system_instructions = (
-            "You are a helpful assistant. Prioritize the document context, but supplement with search results if needed. "
+            "You are a helpful assistant. Use the conversation history, document context, and search results to answer questions. "
+            "Prioritize the document context, but supplement with search results if needed. Reference previous conversation when relevant. "
             "Cite sources when using search results."
         )
-        composed_prompt = (
-            f"Question: {user_message}\n\n"
-            f"Primary Source - Document Context:\n{rag_context}\n\n"
-            f"Secondary Source - Search Results:\n{search_results}\n\n"
-            f"Answer using the document context first. Only use search results to supplement if needed."
+        context_message = (
+            f"Document Context: {rag_context}\n\n"
+            f"Search Results: {search_results}"
         )
     else:
         # Neither available - fallback
-        system_instructions = "You are a helpful assistant. Answer the question based on your general knowledge."
-        composed_prompt = f"Question: {user_message}"
+        system_instructions = (
+            "You are a helpful assistant. Answer questions based on the conversation history and your general knowledge. "
+            "Reference previous parts of the conversation when relevant."
+        )
+        context_message = ""
 
-    messages = [
-        SystemMessage(content=system_instructions),
-        HumanMessage(content=composed_prompt),
-    ]
+    # Build messages with conversation history
+    messages = [SystemMessage(content=system_instructions)]
+    
+    # Add conversation history (all previous messages)
+    messages.extend(state["messages"])
+    
+    # Add context information as a separate message if available
+    if context_message:
+        messages.append(HumanMessage(content=f"Additional Context: {context_message}"))
 
     try:
         response = llm.invoke(messages)

@@ -79,13 +79,21 @@ def chatbot_node(state: ChatbotState) -> dict:
     user_message = state["messages"][-1].content if state["messages"] else ""
     search_results = state.get("search_results", "")
     
-    # Create prompt with conversation history and search results (if any)
-    prompt = f"User: {user_message}\n"
-    if search_results:
-        prompt += f"Search Results:\n{search_results}\n"
-    prompt += "Provide a concise and accurate response based on the conversation history and any available search results. Include source links if search results are used."
+    # Create system message with instructions
+    system_instructions = (
+        "You are a helpful assistant. Use the conversation history to maintain context and provide relevant responses. "
+        "Reference previous parts of the conversation when relevant. "
+    )
     
-    messages = state["messages"] + [HumanMessage(content=prompt)]
+    # Build messages with conversation history
+    messages = [HumanMessage(content=system_instructions)]
+    
+    # Add all conversation history
+    messages.extend(state["messages"])
+    
+    # Add search results as additional context if available
+    if search_results and "No relevant search results found" not in search_results:
+        messages.append(HumanMessage(content=f"Additional Context from Web Search: {search_results}\n\nPlease provide a response using both the conversation history and search results. Include source links when referencing search results."))
     
     try:
         response = llm.invoke(messages)
