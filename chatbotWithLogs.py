@@ -47,46 +47,63 @@ if SERPER_API_KEY:
 
 def should_search(state: ChatbotState) -> str:
     """Always go to chatbot first - retrieve RAG context and let LLM decide."""
+    print("Starting workflow - retrieving RAG context...")
     user_message = state["messages"][-1].content if state["messages"] else ""
     
     # Retrieve RAG context
     try:
         rag_context = retrieve_context(user_message, k=3)
         state["rag_context"] = rag_context if rag_context else ""
+        print(f"Retrieved context length: {len(state['rag_context'])} characters")
+        if state["rag_context"]:
+            print(f" Context preview: {state['rag_context'][:100]}...")
+        else:
+            print(" No relevant context found")
     except Exception as e:
+        print(f" Error retrieving context: {e}")
         state["rag_context"] = ""
     
     state["requires_search"] = False
+    print(" Going to chatbot_node")
     return "chatbot_node"
 
 
 def check_if_search_needed(state: ChatbotState) -> str:
     """Check if the LLM's response indicates it needs search."""
+    print("Checking if search is needed...")
     
     if not search:
+        print("No search API available, ending")
         return END
         
     if not state.get("requires_search", False):
+        print(" No search required, ending conversation")
         return END
     
     # Get the last AI response
     last_message = state["messages"][-1] if state["messages"] else None
     if not last_message or not isinstance(last_message, AIMessage):
+        print("No valid AI message found, ending")
         return END
     
     response_content = (last_message.content or "").lower()
+    print(f"Analyzing response: {response_content[:100]}...")
     
     # Check if the response indicates need for internet search
     if "should search internet" in response_content or "should search the internet" in response_content:
+        print(" Search phrase detected! Going to search_node")
         return "search_node"
     else:
+        print(" No search phrase found, ending")
         return END
 
 
 def search_node(state: ChatbotState) -> dict:
     """Run Serper search and format top results."""
+    print(" Starting internet search...")
     
     if not search:
+        print(" No search API available")
         return {"search_results": None}
 
     # Get the original user query, not the LLM's response
@@ -98,7 +115,9 @@ def search_node(state: ChatbotState) -> dict:
     
     if not user_message:
         user_message = state["messages"][-1].content if state["messages"] else ""
-        
+    
+    print(f"Searching for: {user_message}")
+    
     try:
         results = search.results(user_message)
         formatted = ""
@@ -110,14 +129,18 @@ def search_node(state: ChatbotState) -> dict:
                 formatted += f"- {title}: {snippet} [Source: {link}]\n"
         if not formatted:
             formatted = "No relevant search results found."
-
+        
+        print(f"Found {len(results.get('organic', []))} results")
+        print(f"Formatted results length: {len(formatted)} characters")
         return {"search_results": formatted}
     except Exception as e:
+        print(f" Error: {e}")
         return {"search_results": f"Error fetching search results: {e}"}
 
 
 def chatbot_node(state: ChatbotState) -> dict:
     """Generate the assistant reply using chat history, RAG context and optional search results."""
+    print("Starting chatbot processing...")
     user_message = state["messages"][-1].content if state["messages"] else ""
 
     # Get RAG context and search results
@@ -129,6 +152,7 @@ def chatbot_node(state: ChatbotState) -> dict:
     has_rag_context = rag_context and rag_context.strip() and len(rag_context.strip()) > 50
 
     if has_search_results:
+        print("Using search results for final answer")
         # We have search results - provide comprehensive answer using them
         if has_rag_context:
             # Combine both RAG and search results
@@ -139,6 +163,7 @@ def chatbot_node(state: ChatbotState) -> dict:
                 "Cite sources when using search results."
             )
             context_message = f"Document Context: {rag_context}\n\nSearch Results: {search_results}"
+            print(f"Using both RAG context ({len(rag_context)} chars) and search results")
         else:
             # Use search results only
             system_instructions = (
@@ -147,8 +172,10 @@ def chatbot_node(state: ChatbotState) -> dict:
                 "Reference previous parts of the conversation when relevant. Cite sources inline when using search results."
             )
             context_message = f"Search Results: {search_results}"
-        
+            print(f"Using search results only")
+
     else:
+        print("First attempt - using RAG context and general knowledge")
         # First attempt - use RAG context and general knowledge
         system_instructions = (
             "You are a helpful assistant. Answer the question using the provided document context and conversation history. "
@@ -159,8 +186,10 @@ def chatbot_node(state: ChatbotState) -> dict:
         
         if has_rag_context:
             context_message = f"Document Context: {rag_context}"
+            print(f"Using RAG context ({len(rag_context)} chars)")
         else:
             context_message = "Document Context: No relevant documents found."
+            print("No RAG context available, relying on general knowledge")
 
     # Build messages with conversation history
     messages = [SystemMessage(content=system_instructions)]
@@ -171,22 +200,30 @@ def chatbot_node(state: ChatbotState) -> dict:
     # Add context information as a separate message
     messages.append(HumanMessage(content=f"Additional Context: {context_message}"))
 
+    print(f"Sending {len(messages)} messages to LLM")
     try:
         response = llm.invoke(messages)
+        print(f"Received response: {response.content[:100]}...")
         
         # Only check for search trigger if we don't already have search results
         if not has_search_results:
             response_content = (response.content or "").lower()
             should_search = "should search internet" in response_content or "should search the internet" in response_content
-        
+            
+            if should_search:
+                print("Response indicates search needed - setting requires_search=True")
+            else:
+                print("§Response complete - no search needed")
         else:
             should_search = False
+            print("Final answer provided using search results")
         
         return {
             "messages": state["messages"] + [AIMessage(content=response.content)],
             "requires_search": should_search and search is not None,
         }
     except Exception as e:
+        print(f"Error: {e}")
         return {
             "messages": state["messages"] + [AIMessage(content=f"Error generating response: {e}")],
             "requires_search": False,
@@ -194,6 +231,7 @@ def chatbot_node(state: ChatbotState) -> dict:
 
 
 def start_node(state: ChatbotState) -> dict:
+    print("Starting new conversation turn")
     return {"requires_search": False}
 
 
@@ -215,7 +253,7 @@ workflow.add_edge("search_node", "chatbot_node")
 app = workflow.compile()
 
 
-def run_chatbot():
+def run_chatbot_with_logs():
     """Simple CLI loop for chatting."""
     state: ChatbotState = {
         "messages": [], 
@@ -223,18 +261,26 @@ def run_chatbot():
         "rag_context": None,
         "requires_search": False
     }
+    print("Chatbot started. Type 'quit' to exit.")
+    print("=" * 50)
     while True:
         user_input = input("You: ")
         if user_input.strip().lower() in {"quit", "exit"}:
             break
         
+        print("=" * 50)
+        print(f"Question: {user_input}")
+        
         state["messages"].append(HumanMessage(content=user_input))
         state["rag_context"] = None  # Reset for new query
         state["requires_search"] = False  # Reset for new query
         state["search_results"] = None  # Reset search results
+        
         state = app.invoke(state)
+        print("=" * 50)
         print("Bot:", state["messages"][-1].content)
+        print("=" * 50)
 
 
 if __name__ == "__main__":
-    run_chatbot()
+    run_chatbot_with_logs()
