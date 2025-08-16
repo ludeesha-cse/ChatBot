@@ -20,6 +20,7 @@ class ChatbotState(TypedDict):
     search_results: Optional[str]
     rag_context: Optional[str]
     requires_search: bool
+    search_attempted: bool
 
 
 # Initialize LLM (OpenAI)
@@ -45,27 +46,31 @@ if SERPER_API_KEY:
         search = None
 
 
-def should_search(state: ChatbotState) -> str:
-    """Always go to chatbot first - retrieve RAG context and let LLM decide."""
+def retrieve_rag_context_node(state: ChatbotState) -> dict:
+    """Retrieve RAG context and store it in state."""
     print("Starting workflow - retrieving RAG context...")
     user_message = state["messages"][-1].content if state["messages"] else ""
     
     # Retrieve RAG context
     try:
         rag_context = retrieve_context(user_message, k=3)
-        state["rag_context"] = rag_context if rag_context else ""
-        print(f"Retrieved context length: {len(state['rag_context'])} characters")
-        if state["rag_context"]:
-            print(f" Context preview: {state['rag_context'][:100]}...")
+        retrieved_context = rag_context if rag_context else ""
+        print(f"Retrieved context length: {len(retrieved_context)} characters")
+        if retrieved_context:
+            print(f" Context preview: {retrieved_context[:100]}...")
         else:
             print(" No relevant context found")
     except Exception as e:
         print(f" Error retrieving context: {e}")
-        state["rag_context"] = ""
+        retrieved_context = ""
     
-    state["requires_search"] = False
     print(" Going to chatbot_node")
-    return "chatbot_node"
+    return {"rag_context": retrieved_context}
+
+
+def should_search(state: ChatbotState) -> str:
+    """Always go to chatbot first - retrieve RAG context and let LLM decide."""
+    return "retrieve_rag_context_node"
 
 
 def check_if_search_needed(state: ChatbotState) -> str:
@@ -78,6 +83,10 @@ def check_if_search_needed(state: ChatbotState) -> str:
         
     if not state.get("requires_search", False):
         print(" No search required, ending conversation")
+        return END
+    
+    # If we already attempted search, don't search again
+    if state.get("search_attempted", False):
         return END
     
     # Get the last AI response
@@ -104,7 +113,7 @@ def search_node(state: ChatbotState) -> dict:
     
     if not search:
         print(" No search API available")
-        return {"search_results": None}
+        return {"search_results": None, "search_attempted": True}
 
     # Get the original user query, not the LLM's response
     user_message = ""
@@ -132,10 +141,10 @@ def search_node(state: ChatbotState) -> dict:
         
         print(f"Found {len(results.get('organic', []))} results")
         print(f"Formatted results length: {len(formatted)} characters")
-        return {"search_results": formatted}
+        return {"search_results": formatted, "search_attempted": True}
     except Exception as e:
         print(f" Error: {e}")
-        return {"search_results": f"Error fetching search results: {e}"}
+        return {"search_results": f"Error fetching search results: {e}", "search_attempted": True}
 
 
 def chatbot_node(state: ChatbotState) -> dict:
@@ -146,10 +155,20 @@ def chatbot_node(state: ChatbotState) -> dict:
     # Get RAG context and search results
     rag_context = state.get("rag_context", "")
     search_results = state.get("search_results") or ""
+    search_attempted = state.get("search_attempted", False)
 
     # Determine if we have search results
     has_search_results = search_results and "No relevant search results found" not in search_results
-    has_rag_context = rag_context and rag_context.strip() and len(rag_context.strip()) > 50
+    
+    # Check if we have valid RAG context (not error messages or "No relevant documents found")
+    has_rag_context = (rag_context and 
+                      rag_context.strip() and 
+                      len(rag_context.strip()) > 50 and
+                      not rag_context.startswith("No relevant documents found") and
+                      not rag_context.startswith("Retrieval error:"))
+
+    # Check if this is a question or statement
+    is_question = any(word in user_message.lower() for word in ['?', 'what', 'how', 'why', 'when', 'where', 'who', 'which', 'can you', 'could you', 'would you', 'will you', 'do you', 'are you', 'is it', 'tell me', 'answer me'])
 
     if has_search_results:
         print("Using search results for final answer")
@@ -176,13 +195,22 @@ def chatbot_node(state: ChatbotState) -> dict:
 
     else:
         print("First attempt - using RAG context and general knowledge")
-        # First attempt - use RAG context and general knowledge
-        system_instructions = (
-            "You are a helpful assistant. Answer the question using the provided document context and conversation history. "
-            "If the document context is not sufficient or irrelevant to answer the question, use your general knowledge. "
-            "If you cannot answer the question with either the document context or your general knowledge, "
-            "reply with exactly this phrase: 'I cannot answer this question with the available information. Should search internet.'"
-        )
+        # First attempt or after failed search - use RAG context and general knowledge
+        if search_attempted or not is_question:
+            # If search was already attempted and failed, OR if it's not a question, just use general knowledge
+            system_instructions = (
+                "If the user is sharing information about themselves, acknowledge it politely and remember it for future conversation. "
+                "If the user is asking a question, use the provided document context if relevant, otherwise use your general knowledge to provide a helpful response. "
+                "Be conversational and friendly in your responses."
+            )
+        else:
+            # First attempt with a question - allow search trigger
+            system_instructions = (
+                "Answer the question using the provided document context and conversation history. "
+                "If the document context is not sufficient or irrelevant to answer the question, use your general knowledge. "
+                "If you cannot answer the question with either the document context or your general knowledge, "
+                "reply with exactly this phrase: 'I cannot answer this question with the available information. Should search internet.'"
+            )
         
         if has_rag_context:
             context_message = f"Document Context: {rag_context}"
@@ -206,7 +234,7 @@ def chatbot_node(state: ChatbotState) -> dict:
         print(f"Received response: {response.content[:100]}...")
         
         # Only check for search trigger if we don't already have search results
-        if not has_search_results:
+        if not has_search_results and not search_attempted and is_question:
             response_content = (response.content or "").lower()
             should_search = "should search internet" in response_content or "should search the internet" in response_content
             
@@ -232,19 +260,21 @@ def chatbot_node(state: ChatbotState) -> dict:
 
 def start_node(state: ChatbotState) -> dict:
     print("Starting new conversation turn")
-    return {"requires_search": False}
+    return {"requires_search": False, "search_attempted": False}
 
 
 # Build LangGraph
 workflow = StateGraph(ChatbotState)
 workflow.add_node("start_node", start_node)
+workflow.add_node("retrieve_rag_context_node", retrieve_rag_context_node)
 workflow.add_node("search_node", search_node)
 workflow.add_node("chatbot_node", chatbot_node)
 
 workflow.set_entry_point("start_node")
 workflow.add_conditional_edges(
-    "start_node", should_search, {"chatbot_node": "chatbot_node"}
+    "start_node", should_search, {"retrieve_rag_context_node": "retrieve_rag_context_node"}
 )
+workflow.add_edge("retrieve_rag_context_node", "chatbot_node")
 workflow.add_conditional_edges(
     "chatbot_node", check_if_search_needed, {"search_node": "search_node", END: END}
 )
@@ -259,7 +289,8 @@ def run_chatbot_with_logs():
         "messages": [], 
         "search_results": None, 
         "rag_context": None,
-        "requires_search": False
+        "requires_search": False,
+        "search_attempted": False
     }
     print("Chatbot started. Type 'quit' to exit.")
     print("=" * 50)
@@ -274,6 +305,7 @@ def run_chatbot_with_logs():
         state["messages"].append(HumanMessage(content=user_input))
         state["rag_context"] = None  # Reset for new query
         state["requires_search"] = False  # Reset for new query
+        state["search_attempted"] = False  # Reset search attempted flag
         state["search_results"] = None  # Reset search results
         
         state = app.invoke(state)
